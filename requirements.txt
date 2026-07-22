@@ -1,0 +1,12 @@
+﻿anthropic
+python-dotenv
+requests
+icalendar
+gradescopeapi
+customtkinter
+mss
+Pillow
+pyautogui
+pygetwindow
+uiautomation
+ollama
