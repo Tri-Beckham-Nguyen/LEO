@@ -9,4 +9,3 @@ Pillow
 pyautogui
 pygetwindow
 uiautomation
-ollama
