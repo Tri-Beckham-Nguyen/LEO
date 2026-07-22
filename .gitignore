@@ -1,0 +1,12 @@
+.env
+venv/
+.venv/
+__pycache__/
+*.pyc
+leo_memory.json
+leo_hard_tasks.json
+leo_pending_click.png
+*.png
+leo_backups/
+*.bat
+gs_test.py
