@@ -3,10 +3,12 @@ LEO's ambient face: one question, one answer on screen at a time.
 On launch it greets you with today's agenda. All thinking lives in leo.py.
 Run from the LEO folder:  python leo_app.py
 """
+import queue
 import threading
+import time
 import customtkinter as ctk
 
-from leo import ask_brain, todays_agenda, _mark_hard, _ask_brain_cloud, _console_confirm  # same brain as the terminal
+from leo import ask_brain, todays_agenda, _mark_hard, _ask_brain_cloud, load_conversation, save_conversation
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("green")
@@ -15,8 +17,6 @@ GREEN = "#00ff9f"
 DIM = "#5f8f79"
 FONT = ("Consolas", 13)
 
-conversation = []  # kept in the background so follow-up questions have context
-
 
 class LeoApp(ctk.CTk):
     def __init__(self):
@@ -24,12 +24,20 @@ class LeoApp(ctk.CTk):
         self.title("LEO")
         self.attributes("-topmost", True)
 
-        w, h = 400, 320
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
-        self.geometry(f"{w}x{h}+{sw - w - 24}+{sh - h - 64}")  # bottom-right corner
+        w, h = 480, 620
+        x = sw - w - 20
+        y = 40
+        self.geometry(f"{w}x{h}+{x}+{y}")
         self.minsize(320, 240)
 
         self._anim = None
+        self._ui_q = queue.Queue()
+        self._confirm_q = queue.Queue()
+
+        self.conversation = load_conversation()
+
+        self._last_question = ""
 
         ctk.CTkLabel(self, text="LEO", font=("Consolas", 20, "bold"),
                      text_color=GREEN).pack(pady=(10, 2))
@@ -48,30 +56,87 @@ class LeoApp(ctk.CTk):
         self.entry = ctk.CTkTextbox(row, font=FONT, wrap="word", height=64,
                                     fg_color="#141a17")
         self.entry.pack(side="left", fill="x", expand=True)
-        self.entry.bind("<Return>", self._on_return)          # Enter sends
-        self.entry.bind("<Shift-Return>", lambda e: None)     # Shift+Enter = newline
+        self.entry.bind("<Return>", self._on_return)
+        self.entry.bind("<Shift-Return>", lambda e: None)
         self.send_btn = ctk.CTkButton(row, text="Send", width=64, command=self.on_send)
         self.send_btn.pack(side="left", padx=(8, 0))
-        # You are the only reliable judge of a fluent-but-wrong local answer.
-        self.fail_btn = ctk.CTkButton(row, text="\u2717 failed", width=70,
+        self.fail_btn = ctk.CTkButton(row, text="✕ failed", width=70,
                                       fg_color="#8a3b3b", command=self.on_failed)
         self.fail_btn.pack(side="left", padx=(6, 0))
         self.entry.focus()
 
-        # Greet with today's agenda, fetched off the UI thread so the window
-        # doesn't freeze while it hits the network.
-        self._show("Loading your agenda...")
+        # Additional buttons row
+        tools = ctk.CTkFrame(self, fg_color="transparent")
+        tools.pack(fill="x", padx=10, pady=(0, 4))
+        ctk.CTkButton(tools, text="🎤 Voice", width=70, command=self.voice_input).pack(side="left", padx=2)
+        ctk.CTkButton(tools, text="🌓 Theme", width=70, command=self.toggle_theme).pack(side="left", padx=2)
+        ctk.CTkButton(tools, text="📜 History", width=70, command=self.show_history).pack(side="left", padx=2)
+        ctk.CTkButton(tools, text="🧹 Clear", width=70, command=self.clear_conversation).pack(side="left", padx=2)
+
+        self.after(50, self._poll_ui)
+        self.after(100, self._poll_confirms)
+
+        self._show("Loading agenda...")
         threading.Thread(target=self._load_agenda, daemon=True).start()
+
+        # Proactive agenda checker
+        self._last_agenda = None
+        self.proactive_thread = threading.Thread(target=self._proactive_loop, daemon=True)
+        self.proactive_thread.start()
+
+    # ---- cross-thread UI helpers ----------------------------------------
+
+    def _ui_call(self, fn, *args, **kwargs):
+        self._ui_q.put((fn, args, kwargs))
+
+    def _poll_ui(self):
+        try:
+            while True:
+                fn, args, kwargs = self._ui_q.get_nowait()
+                fn(*args, **kwargs)
+        except queue.Empty:
+            pass
+        self.after(50, self._poll_ui)
+
+    def _poll_confirms(self):
+        try:
+            while True:
+                description, done, result = self._confirm_q.get_nowait()
+                if result.get("timed_out"):
+                    continue
+                self._open_confirm_dialog(description, done, result)
+        except queue.Empty:
+            pass
+        self.after(100, self._poll_confirms)
+
+    # ---- agenda loading --------------------------------------------------
 
     def _load_agenda(self):
         try:
             text = todays_agenda()
+            self._last_agenda = text
         except Exception as e:
             text = f"Online. Ask me anything.\n\n(agenda unavailable: {e})"
-        self.after(0, lambda: self._show(text))
+        self._ui_call(self._show, text)
 
-    def _show(self, text):
+    # ---- proactive loop --------------------------------------------------
+
+    def _proactive_loop(self):
+        while True:
+            time.sleep(3600)  # check every hour
+            try:
+                agenda = todays_agenda()
+                if agenda != self._last_agenda:
+                    self._ui_call(self._show, agenda)
+                    self._last_agenda = agenda
+            except Exception:
+                pass
+
+    # ---- display helpers -------------------------------------------------
+
+    def _show(self, text, font=None):
         self.response.configure(state="normal")
+        self.response.configure(font=font or FONT)
         self.response.delete("1.0", "end")
         self.response.insert("1.0", text)
         self.response.configure(state="disabled")
@@ -91,6 +156,8 @@ class LeoApp(ctk.CTk):
         if not busy:
             self.entry.focus()
 
+    # ---- user input ------------------------------------------------------
+
     def _on_return(self, event):
         self.on_send()
         return "break"
@@ -106,18 +173,75 @@ class LeoApp(ctk.CTk):
         self._animate()
         threading.Thread(target=self._think, args=(text,), daemon=True).start()
 
-    def _think(self, text):
-        checkpoint = len(conversation)
-        conversation.append({"role": "user", "content": text})
+    def voice_input(self):
+        """Capture voice using sounddevice and recognize with Google."""
         try:
-            reply = ask_brain(conversation, confirm=self._confirm)
+            import sounddevice as sd
+            import numpy as np
+            import speech_recognition as sr
+
+            r = sr.Recognizer()
+            self._show("Listening...")
+            duration = 5  # seconds
+            sample_rate = 16000
+            audio = sd.rec(int(duration * sample_rate), samplerate=sample_rate, channels=1, dtype='int16')
+            sd.wait()
+            raw = audio.tobytes()
+            audio_data = sr.AudioData(raw, sample_rate, 2)
+            text = r.recognize_google(audio_data)
+            self._ui_call(self.entry.insert, "1.0", text)
         except Exception as e:
-            del conversation[checkpoint:]
+            self._ui_call(self._show, f"Voice error: {e}")
+
+    def toggle_theme(self):
+        current = ctk.get_appearance_mode()
+        new = "Light" if current == "Dark" else "Dark"
+        ctk.set_appearance_mode(new)
+
+    def show_history(self):
+        """Open a window showing the current conversation history."""
+        win = ctk.CTkToplevel(self)
+        win.title("Conversation History")
+        win.geometry("600x400")
+        win.attributes("-topmost", True)
+        box = ctk.CTkTextbox(win, font=("Consolas", 12), wrap="word")
+        box.pack(fill="both", expand=True, padx=10, pady=10)
+        text = ""
+        for msg in self.conversation:
+            role = msg.get("role", "unknown")
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                parts = []
+                for b in content:
+                    if isinstance(b, dict):
+                        if b.get("type") == "text":
+                            parts.append(b.get("text", ""))
+                        elif b.get("type") == "tool_use":
+                            parts.append(f"[tool: {b.get('name')}]")
+                content = " ".join(parts)
+            text += f"{role.upper()}: {content}\n\n"
+        box.insert("1.0", text)
+        box.configure(state="disabled")
+
+    def clear_conversation(self):
+        """Reset the conversation."""
+        self.conversation = []
+        save_conversation(self.conversation)
+        self._last_question = ""
+        self.q_label.configure(text="")
+        self._show("Conversation cleared.")
+
+    def _think(self, text):
+        checkpoint = len(self.conversation)
+        self.conversation.append({"role": "user", "content": text})
+        try:
+            reply = ask_brain(self.conversation, confirm=self._confirm)
+        except Exception as e:
+            del self.conversation[checkpoint:]
             reply = f"[error] {e}"
-        self.after(0, lambda: self._finish(reply))
+        self._ui_call(self._finish, reply)
 
     def on_failed(self):
-        """Mark the last question as cloud-only forever, then redo it on cloud."""
         q = getattr(self, "_last_question", "")
         if not q:
             return
@@ -132,57 +256,56 @@ class LeoApp(ctk.CTk):
             reply = _ask_brain_cloud(convo, self._confirm)
         except Exception as e:
             reply = f"[error] {e}"
-        self.after(0, lambda: self._finish(reply))
+        self._ui_call(self._finish, reply)
+
+    # ---- approval dialog --------------------------------------------------
 
     def _confirm(self, description):
-        """Called from the worker thread. Shows a modal approval dialog on the UI
-        thread and blocks until Beckham answers. Returns True ONLY on Approve."""
         done = threading.Event()
         result = {"ok": False}
-        dlg_ref = {}
-
-        def ask():
-            dlg = ctk.CTkToplevel(self)
-            dlg.title("Approve this action?")
-            dlg.attributes("-topmost", True)
-            dlg.lift()
-            dlg.focus_force()      # make sure it cannot hide behind a window
-            dlg.bell()             # audible: you are being asked for permission
-            dlg.geometry("560x460")
-            ctk.CTkLabel(dlg, text="LEO wants to run this. READ it, then decide.",
-                         text_color=GREEN, font=("Consolas", 14, "bold")).pack(pady=(10, 4))
-            box = ctk.CTkTextbox(dlg, font=("Consolas", 12), wrap="none",
-                                 fg_color="#0b0f0d", text_color="#d7ffe9")
-            box.pack(fill="both", expand=True, padx=10, pady=6)
-            box.insert("1.0", description)
-            box.configure(state="disabled")
-            btns = ctk.CTkFrame(dlg, fg_color="transparent")
-            btns.pack(pady=10)
-
-            def finish(ok):
-                result["ok"] = ok
-                dlg.destroy()
-                done.set()
-
-            ctk.CTkButton(btns, text="Approve", fg_color="#00ff9f", text_color="black",
-                          command=lambda: finish(True)).pack(side="left", padx=8)
-            ctk.CTkButton(btns, text="Cancel", fg_color="#d43f3f",
-                          command=lambda: finish(False)).pack(side="left", padx=8)
-            dlg_ref["d"] = dlg
-            dlg.protocol("WM_DELETE_WINDOW", lambda: finish(False))  # closing = cancel
-            dlg.grab_set()
-
-        self.after(0, ask)
-        # Never block forever: an unanswered gate used to hang LEO for good.
+        self._confirm_q.put((description, done, result))
         if not done.wait(timeout=120):
-            self.after(0, lambda: (dlg_ref.get("d") and dlg_ref["d"].destroy()))
-            return False           # timed out = DENIED (safe default)
+            result["timed_out"] = True
+            return False
         return result["ok"]
+
+    def _open_confirm_dialog(self, description, done, result):
+        dlg = ctk.CTkToplevel(self)
+        dlg.title("Approve this action?")
+        dlg.attributes("-topmost", True)
+        dlg.lift()
+        dlg.focus_force()
+        dlg.bell()
+        dlg.geometry("560x460")
+        ctk.CTkLabel(dlg, text="LEO wants to run this. READ it, then decide.",
+                     text_color=GREEN, font=("Consolas", 14, "bold")).pack(pady=(10, 4))
+        box = ctk.CTkTextbox(dlg, font=("Consolas", 12), wrap="none",
+                             fg_color="#0b0f0d", text_color="#d7ffe9")
+        box.pack(fill="both", expand=True, padx=10, pady=6)
+        box.insert("1.0", description)
+        box.configure(state="disabled")
+        btns = ctk.CTkFrame(dlg, fg_color="transparent")
+        btns.pack(pady=10)
+
+        def finish(ok):
+            result["ok"] = ok
+            dlg.destroy()
+            done.set()
+
+        ctk.CTkButton(btns, text="Approve", fg_color="#00ff9f", text_color="black",
+                      command=lambda: finish(True)).pack(side="left", padx=8)
+        ctk.CTkButton(btns, text="Cancel", fg_color="#d43f3f",
+                      command=lambda: finish(False)).pack(side="left", padx=8)
+        dlg.protocol("WM_DELETE_WINDOW", lambda: finish(False))
+        dlg.grab_set()
+
+    # ---- finish ----------------------------------------------------------
 
     def _finish(self, reply):
         self._stop_anim()
         self._show(reply)
         self._set_busy(False)
+        save_conversation(self.conversation)
 
 
 if __name__ == "__main__":
